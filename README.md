@@ -1,4 +1,5 @@
-![somewhere](./somewhere.jpg)
+我们采集的只是石头，却必须时刻展望未来的大教堂。
+
 <!--
 **day-dreams/day-dreams** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
 
