@@ -75,11 +75,72 @@
     * 有啥用？ 数据库crash后重新启动，可以使用redo log去继续完成未完成的数据操作
   * Undo Logs
     * 存的什么东西？ 每个事务的变更数据的原始版本。**仅限于clustered index的数据**
-    * 有啥用？ 用于一致性读。暂时理解为，用于实现MVCC。每个事物在读取
+    * 有啥用？ 用于一致性读。暂时理解为，用于实现MVCC。
 
 ## 锁和事务
 
+又来到这个话题，我都记不清是第几次重新学习这个内容了。
+一直以为公司db是默认的可重复度，直到前几个月发现，竟然是读已提交。
 
+* innodb locking 老生畅谈，不多赘述
+  * Shared/Exclusive Locks
+  * Intention Locks
+  * Record Locks，针对一条索引记录的锁
+  * Gap locks，在两条索引记录之前，或第一条索引之前，或最后一条索引之后的锁
+    * 间隙锁和唯一索引
+      * **不适用于** 使用唯一索引作为搜索条件，只搜一条记录的语句
+      * **适用于** 使用了唯一索引的某些列作为搜索条件的语句
+      * **为什么** 间隙锁锁的是间隙，目的是保证一个事务内，多次执行语句可以得到一样的结果。如果是完全使用唯一索引，且只搜一条唯一的记录，那么其他位置不管插入了什么语句，都无所谓的，反正不会出现在搜索结果
+    * 间隙锁和非唯一索引
+      * **适用于** 任何情况。因为不管怎么样，你的sql最终都会定位在某个索引范围内，如果不加间隙锁，另外一条语句插入了相同索引值的记录，那你的sql就无法保证一致性读了。这个时候，就出现了幻读
+    * 多个事务可以对同一个索引范围加间隙锁
+      * 因为大家的目的都是保证“索引范围内不要出现新的记录”。所以不管有几个事务去加间隙锁，都无所谓
+  * Next-Key locks，就是间隙锁和记录锁的组合形式
+    * **幻读** Next-Key locks解决了幻读问题
+  * Insert Intention Locks 意向锁
+    * 这个就是我们想要的写锁了。如果我们查询一条记录，并根据某些条件去更新对应的字段，就需要加意向锁，加完意向锁，其他事务就不能读这条记录了
+    * 有两种加意向锁的方法
+      * 显示的声明for update，`select * from t_table where id = 100 for update`
+      * 直接更新一条记录，`update t_table set value='xyz' where id = 100`
+      * 随便组合这两种sql，都会彼此冲突，陷入锁等待 
+    * 和一致性读的关系
+      * 一致性读显然是不和意向锁冲突的。人家根本不管锁不锁的，也不会尝试加锁。一致性读从mvcc里获取到可见的记录，就直接返回了
+      * 所以这样的语句是不会陷入阻塞的 `select * from t_table where id = 100`
+  * AUTO-INC Locks 自增锁
+    * 这个在innodb的磁盘结构里，已经研究过了。三种工作模式，有可能影响复制和批量插入语句。
+  * Predicate Locks for Spatial Indexes
+* innodb transaction model
+  * 隔离级别
+    * 读未提交 < 读已提交 < 可重复读 < 串行化
+    * `怎么设置` 可以为server设置默认的级别，也可以为每个连接/事务设置不同的级别
+    * `可重复读` 默认的隔离级别 
+      * 当然一致性读仍然是不加锁的，是有locking reads会加锁
+      * 如果使用了唯一索引、唯一的搜索条件（因此最终只能定位到一条记录），innodb会给记录加record key
+      * 除此之外，innodb给记录加上gap lock或者next-key锁 
+      * 每个Locking reads在过滤数据记录时，会先获得要扫描的记录的锁，然后在commit/rollback时统一提交
+    * `读已提交` 如果一致性没有那么重要，可以减少锁的使用，从而提高并发
+      * 一致性读仍然不加锁；Lockings read仍然会加锁 
+      * Locking Reads不再加gap/next-key lock，仅仅加记录锁。而且使用搜索条件过滤完一行记录时，就会立刻释放该条记录的锁
+      * **特别的** update语句直接会获取记录的最新版本（即使是其他事务新提交的数据），作为搜索条件的过滤数据。所以一个事物可以读到另一个事务新提交的记录。也就是幻读。
+      * 这个级别下，binlog只能是row-based baniry format，而不是sql format。因为sql的执行结果不再是确定的，如果有其他事务正在进行，数据结果就有可能不一致。
+    * `读为提交` 一个完全没有锁的模式
+      * 这个模式下，几乎没有锁的限制。所以并发可以拉到最高，但是会出现脏读问题
+    * `串行化` 
+      * 几乎所有语句都加锁。连一致性读都被强制转换成Lokcing reads来处理 
+  * 一致性读 Consistent Nonlocking Reads 就是乐观锁MVCC
+  * `当前读` 即使是可重复读，update/delete语句还是会有一些问题
+    * 比如两个事务A、B同时开始
+      * A: `select * from t where x=1`,没有查到数据
+      * B: `insert into t (x)values(1)`,成功
+      * A: `delete from t where x=1`，**陷入锁等待**
+      * B: commit
+      * A: commit
+      * 这时我们执行一条`select * from t where x=1`，发现B插入的数据不存在了
+      * 按理说，A不应该读到B未提交的数据，也就是delete的条件不应该得到满足
+      * 实际上，`update/delete ...... where ......`使用的是“当前读”，即获取当前最新版本的数据，而不是当前事务开始之前的最新版本。这个和“快照读”有明显的区别！
+* locks set by different sql statements
+* phantom rows
+* deadlocks in innodb
 
 ## 备份与恢复
 
@@ -93,3 +154,6 @@
 * sql语句模式的复制场景下，自增锁有什么影响
 * dobulewrite buffer的工作流程如何？有什么作用
 * redo log和undo log存储了什么数据，用于哪些场景
+* 四种隔离级别，对锁的处理有什么不同
+* 在repeated read和read commited模式下，innodb执行locking reads，对记录的加锁方式有什么不同
+* `当前读`是什么
